@@ -5,11 +5,26 @@ import requests
 from fastapi import FastAPI, BackgroundTasks
 from dotenv import load_dotenv
 from google import genai
+from pydantic import BaseModel, ConfigDict, Field
 
 
 load_dotenv()
 
 app = FastAPI()
+
+
+# =========================
+# Incident Payload
+# =========================
+
+class IncidentPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    incident_sys_id: str
+    number: str
+    short_description: str
+    description: str
+    priority: int = Field(ge=1, le=5)
 
 
 # =========================
@@ -31,70 +46,76 @@ SERVICENOW_PASSWORD = os.getenv("SERVICENOW_PASSWORD")
 
 
 # =========================
-# Processed incidents
+# Duplicate Protection
 # =========================
 
 processed_incidents = set()
 
 
 # =========================
-# Gemini decision
+# Gemini Decision
 # =========================
 
 def get_gemini_decision(data):
 
-    # Read prompt
     with open("prompt.txt", "r", encoding="utf-8") as f:
         prompt = f.read()
 
-    # Put incident data inside the prompt
     prompt = prompt.replace(
         "{number}",
-        str(data.get("number", ""))
+        str(data.number)
     )
 
     prompt = prompt.replace(
         "{short_description}",
-        str(data.get("short_description", ""))
+        str(data.short_description)
     )
 
     prompt = prompt.replace(
         "{description}",
-        str(data.get("description") or "")
+        str(data.description)
     )
 
     prompt = prompt.replace(
         "{priority}",
-        str(data.get("priority", ""))
+        str(data.priority)
     )
 
-    # Ask Gemini
     response = client.models.generate_content(
-        model="gemini-3.6-flash",
+        model="gemini-3.5-flash",
         contents=prompt
     )
 
     print("Gemini response:")
     print(response.text)
 
-    # Remove Markdown code fences if Gemini adds them
     text = response.text.strip()
 
+    # Remove Markdown code fences if Gemini adds them
     if text.startswith("```"):
         text = text.replace("```json", "")
         text = text.replace("```", "")
         text = text.strip()
 
-    # Convert Gemini JSON to Python dictionary
     result = json.loads(text)
 
-    # Check decision
+    # Validate decision
     if result.get("decision") not in [
         "respond",
         "ask",
         "escalate"
     ]:
         raise ValueError("Invalid Gemini decision")
+
+    # Validate required Gemini fields
+    if set(result.keys()) != {"decision", "message"}:
+        raise ValueError(
+            "Gemini response must contain exactly "
+            "'decision' and 'message'"
+        )
+
+    if not isinstance(result["message"], str):
+        raise ValueError("Gemini message must be a string")
 
     return result
 
@@ -103,17 +124,19 @@ def get_gemini_decision(data):
 # Update ServiceNow
 # =========================
 
-def update_servicenow(incident_sys_id, decision, message):
+def update_servicenow(
+    incident_sys_id,
+    decision,
+    message
+):
 
-    print("3 - Calling ServiceNow")
+    print("Calling ServiceNow")
 
-    # Same Incident URL
     url = (
         f"{SERVICENOW_INSTANCE_URL}"
         f"/api/now/table/incident/{incident_sys_id}"
     )
 
-    # Data to write back
     if decision == "respond":
 
         payload = {
@@ -135,8 +158,6 @@ def update_servicenow(incident_sys_id, decision, message):
             "work_notes": message
         }
 
-
-    # PATCH ServiceNow
     response = requests.patch(
         url,
         auth=(
@@ -151,8 +172,15 @@ def update_servicenow(incident_sys_id, decision, message):
         timeout=15
     )
 
-    print("ServiceNow status code:", response.status_code)
-    print("ServiceNow response body:", response.text)
+    print(
+        "ServiceNow status code:",
+        response.status_code
+    )
+
+    print(
+        "ServiceNow response body:",
+        response.text
+    )
 
     response.raise_for_status()
 
@@ -160,17 +188,20 @@ def update_servicenow(incident_sys_id, decision, message):
 
 
 # =========================
-# Process incident
+# Process Incident
 # =========================
 
-def process_incident(data):
+def process_incident(data: IncidentPayload):
+
+    incident_id = data.incident_sys_id
 
     try:
 
-        # Ask Gemini
+        print("Starting incident processing")
+
         result = get_gemini_decision(data)
 
-        print("2 - Gemini finished")
+        print("Gemini finished")
 
         decision = result["decision"]
         message = result["message"]
@@ -178,17 +209,16 @@ def process_incident(data):
         print("Decision:", decision)
         print("Message:", message)
 
-        # Update same Incident
         update_servicenow(
-            data["incident_sys_id"],
+            incident_id,
             decision,
             message
         )
 
-        # Mark as processed
-        processed_incidents.add(
-            data["incident_sys_id"]
-        )
+        # Mark as successfully processed
+        processed_incidents.add(incident_id)
+
+        print("Incident marked as processed")
 
     except Exception as e:
 
@@ -199,23 +229,15 @@ def process_incident(data):
 # Webhook
 # =========================
 
-@app.post("/webhook")
+@app.post("/webhook", status_code=202)
 async def webhook(
-    data: dict,
+    data: IncidentPayload,
     background_tasks: BackgroundTasks
 ):
 
-    # Basic validation
-    if not data.get("incident_sys_id"):
+    incident_id = data.incident_sys_id
 
-        return {
-            "status": "error",
-            "message": "Missing incident_sys_id"
-        }
-
-    incident_id = data["incident_sys_id"]
-
-    # Don't process the same Incident twice
+    # Already completed
     if incident_id in processed_incidents:
 
         return {
@@ -224,15 +246,15 @@ async def webhook(
         }
 
     print("Received incident:")
-    print(data)
+    print(data.model_dump())
 
-    # Run Gemini + ServiceNow in background
+    # Run slow processing in background
     background_tasks.add_task(
         process_incident,
         data
     )
 
-    # Respond immediately
+    # Return immediately
     return {
         "status": "accepted",
         "incident_sys_id": incident_id
